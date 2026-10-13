@@ -1,0 +1,4 @@
+#!/bin/sh
+# locksmith on the command line: see lua/locksmith/command.lua and the README
+root=$(dirname "$(dirname "$(readlink -f "$0")")")
+exec nvim --headless --clean -l "$root/bin/locksmith.lua" "$@"

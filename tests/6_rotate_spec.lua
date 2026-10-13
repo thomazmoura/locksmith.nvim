@@ -1,0 +1,107 @@
+local store = require("locksmith.store")
+
+local function with_store(password)
+  local ls = T.fresh()
+  ls.set_prompt(T.script({ password, password }).fn)
+  T.await(function(done)
+    ls.set("ns", "pat", "s3cret", done)
+  end)
+  T.await(function(done)
+    ls.set("ns", "settings", { a = 1 }, done)
+  end)
+  T.await(function(done)
+    ls.cache("ns").save("contacts", { "Ana" }, done)
+  end)
+  return ls
+end
+
+local function get(ls, namespace, name)
+  return T.await(function(done)
+    ls.get(namespace, name, done)
+  end)
+end
+
+--- Staged or temporary files left in items/ns
+local function staged()
+  return vim.fn.glob(store.data_dir() .. "/items/ns/.*.{gen*,tmp}", true, true)
+end
+
+local function gen_of(namespace, name)
+  return vim.json.decode(T.read(store.item_path("items", namespace, name))).gen
+end
+
+T.test("rotating the data key re-encrypts secrets and config and deletes the caches", function()
+  local ls = with_store("old")
+  local before = T.read(store.item_path("items", "ns", "pat"))
+  ls.set_prompt(T.script({ "old", "new", "new" }).fn)
+  T.eq(T.await(function(done)
+    ls.change_password(done, { rotate_data_key = true })
+  end), true)
+  T.eq(ls.status().dek_generation, 2)
+  T.ok(T.read(store.item_path("items", "ns", "pat")) ~= before)
+  T.eq(gen_of("ns", "pat"), 2)
+  T.eq(gen_of("ns", "settings"), 2)
+  T.eq(vim.uv.fs_stat(store.cache_dir()), nil)
+  -- No staged file left behind
+  T.eq(staged(), {})
+  ls.lock()
+  ls.set_prompt(T.script({ "new" }).fn)
+  T.eq(get(ls, "ns", "pat"), "s3cret")
+  T.eq(get(ls, "ns", "settings"), { a = 1 })
+end)
+
+T.test("a session holding the old data key re-unlocks instead of using it", function()
+  local stale = with_store("old")
+  local rotating = T.instance()
+  rotating.set_prompt(T.script({ "old", "new", "new" }).fn)
+  T.eq(T.await(function(done)
+    rotating.change_password(done, { rotate_data_key = true })
+  end), true)
+  local prompt = T.script({ "new" })
+  stale.set_prompt(prompt.fn)
+  T.eq(stale.status().unlocked, false)
+  T.eq(T.await(function(done)
+    stale.set("ns", "pat", "written after", done)
+  end), true)
+  T.eq(#prompt.calls, 1)
+  T.eq(gen_of("ns", "pat"), 2)
+  rotating.set_prompt(T.script({}).fn)
+  T.eq(get(rotating, "ns", "pat"), "written after")
+end)
+
+T.test("a rotation interrupted after its commit is finished at the next unlock", function()
+  local ls = with_store("old")
+  -- The copy the module uses (T.fresh() loads a new one)
+  local live = package.loaded["locksmith.store"]
+  local commit = live.commit_staged
+  live.commit_staged = function() end
+  ls.set_prompt(T.script({ "old", "new", "new" }).fn)
+  local ok = pcall(T.await, function(done)
+    ls.change_password(done, { rotate_data_key = true })
+  end)
+  live.commit_staged = commit
+  T.ok(ok)
+  T.eq(gen_of("ns", "pat"), 1)
+  ls.lock()
+  ls.set_prompt(T.script({ "new" }).fn)
+  T.eq(get(ls, "ns", "pat"), "s3cret")
+  T.eq(gen_of("ns", "pat"), 2)
+end)
+
+T.test("a rotation stops before anything changes when an item cannot be decrypted", function()
+  local ls = with_store("old")
+  local path = store.item_path("items", "ns", "pat")
+  local content = vim.json.decode(T.read(path))
+  content.tag = vim.base64.encode(("\0"):rep(16))
+  T.write(path, vim.json.encode(content))
+  local header = T.read(store.header_path())
+  ls.set_prompt(T.script({ "old", "new", "new" }).fn)
+  local ok, err = T.await(function(done)
+    ls.change_password(done, { rotate_data_key = true })
+  end)
+  T.eq(ok, nil)
+  T.ok(err:find("nothing changed"))
+  T.eq(T.read(store.header_path()), header)
+  T.eq(gen_of("ns", "settings"), 1)
+  T.eq(staged(), {})
+end)
